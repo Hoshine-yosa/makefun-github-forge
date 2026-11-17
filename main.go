@@ -10,14 +10,72 @@ package main
 
 import (
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 )
 
+// cgroupCPULimit returns the CPU count the container's cgroup quota allows
+// (rounded up, at least 2), or 0 when there is no quota or it cannot be read.
+// Go 1.24 sizes GOMAXPROCS from the host's CPUs, not the quota, so in a
+// CPU-limited sandbox the runtime runs far more Ps and GC workers than the
+// quota can feed and gets CFS-throttled.
+func cgroupCPULimit() int {
+	var quota, period float64
+	if b, err := os.ReadFile("/sys/fs/cgroup/cpu.max"); err == nil {
+		f := strings.Fields(string(b))
+		if len(f) == 2 && f[0] != "max" {
+			q, e1 := strconv.ParseFloat(f[0], 64)
+			p, e2 := strconv.ParseFloat(f[1], 64)
+			if e1 == nil && e2 == nil {
+				quota, period = q, p
+			}
+		}
+	} else if qb, qerr := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"); qerr == nil {
+		if pb, perr := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_period_us"); perr == nil {
+			q, e1 := strconv.ParseFloat(strings.TrimSpace(string(qb)), 64)
+			p, e2 := strconv.ParseFloat(strings.TrimSpace(string(pb)), 64)
+			if e1 == nil && e2 == nil {
+				quota, period = q, p
+			}
+		}
+	}
+	if quota <= 0 || period <= 0 {
+		return 0
+	}
+	n := int(math.Ceil(quota / period))
+	if n < 2 {
+		n = 2
+	}
+	return n
+}
+
+// tuneRuntime applies process-level settings that change no output: it caps
+// GOMAXPROCS at the cgroup CPU quota, and makes the GC run less often (the
+// live heap is a few MB, so the default 100% target collects every ~4 MB of
+// allocation). A soft memory limit keeps the larger GC target safe.
+func tuneRuntime() {
+	if os.Getenv("GOMAXPROCS") == "" {
+		if n := cgroupCPULimit(); n > 0 && n < runtime.GOMAXPROCS(0) {
+			runtime.GOMAXPROCS(n)
+		}
+	}
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(400)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(512 << 20)
+	}
+}
+
 func main() {
+	tuneRuntime()
 	port := os.Getenv("FORGE_PORT")
 	if port == "" {
 		port = "18099"

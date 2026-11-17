@@ -185,12 +185,24 @@ var zlibWriterPool = sync.Pool{
 // only ever added, and every mutation that adds objects also moves a ref
 // (or changes the count), so (refs, count) fingerprints the fetchable state.
 type fetchCache struct {
-	mu    sync.Mutex
-	items map[string][]byte
-	bytes int
+	mu      sync.Mutex
+	items   map[string][]byte
+	flights map[string]*fetchFlight
+	bytes   int
 }
 
-var fetchResponses = fetchCache{items: make(map[string][]byte)}
+// fetchFlight is one in-progress response build; concurrent identical
+// requests wait on done instead of each building the same pack.
+type fetchFlight struct {
+	done chan struct{}
+	out  []byte
+	ok   bool
+}
+
+var fetchResponses = fetchCache{
+	items:   make(map[string][]byte),
+	flights: make(map[string]*fetchFlight),
+}
 
 // fetchCacheMaxBytes bounds the cache; above it the map is dropped wholesale.
 const fetchCacheMaxBytes = 32 << 20
@@ -225,26 +237,58 @@ func fetchCacheKey(repo *Repo, isV2 bool, body []byte) string {
 	return sb.String()
 }
 
-func fetchCacheGet(repo *Repo, isV2 bool, body []byte) ([]byte, bool) {
-	key := fetchCacheKey(repo, isV2, body)
-	fetchResponses.mu.Lock()
-	defer fetchResponses.mu.Unlock()
-	out, ok := fetchResponses.items[key]
-	return out, ok
+// putLocked stores a finished response; the caller holds c.mu.
+func (c *fetchCache) putLocked(key string, out []byte) {
+	if c.bytes+len(out) > fetchCacheMaxBytes {
+		c.items = make(map[string][]byte)
+		c.bytes = 0
+	}
+	if _, exists := c.items[key]; !exists {
+		c.bytes += len(out)
+	}
+	c.items[key] = out
 }
 
-func fetchCachePut(repo *Repo, isV2 bool, body []byte, out []byte) {
-	key := fetchCacheKey(repo, isV2, body)
-	fetchResponses.mu.Lock()
-	defer fetchResponses.mu.Unlock()
-	if fetchResponses.bytes+len(out) > fetchCacheMaxBytes {
-		fetchResponses.items = make(map[string][]byte)
-		fetchResponses.bytes = 0
+// fetchCached returns the response for key, calling build at most once among
+// concurrent callers with the same key (single-flight) and caching the
+// result. The response is a pure function of the key, so every caller gets
+// the same bytes a fresh build would give. If build panics, the panic
+// propagates to its own caller and the waiters retry.
+func fetchCached(key string, build func() []byte) []byte {
+	c := &fetchResponses
+	for {
+		c.mu.Lock()
+		if out, ok := c.items[key]; ok {
+			c.mu.Unlock()
+			return out
+		}
+		if fl, ok := c.flights[key]; ok {
+			c.mu.Unlock()
+			<-fl.done
+			if fl.ok {
+				return fl.out
+			}
+			continue
+		}
+		fl := &fetchFlight{done: make(chan struct{})}
+		c.flights[key] = fl
+		c.mu.Unlock()
+
+		func() {
+			defer func() {
+				c.mu.Lock()
+				delete(c.flights, key)
+				if fl.ok {
+					c.putLocked(key, fl.out)
+				}
+				c.mu.Unlock()
+				close(fl.done)
+			}()
+			fl.out = build()
+			fl.ok = true
+		}()
+		return fl.out
 	}
-	if _, exists := fetchResponses.items[key]; !exists {
-		fetchResponses.bytes += len(out)
-	}
-	fetchResponses.items[key] = out
 }
 
 // writePack builds a plain-object pack (version 2) from objects, sorted by oid
@@ -311,24 +355,63 @@ func (c *countingReader) ReadByte() (byte, error) {
 	return b, err
 }
 
+// zlibReaderPool reuses zlib readers across pack inflations. A fresh
+// zlib.Reader costs ~30µs to create (it allocates decompression tables);
+// Reset reuses one for ~9µs. A reader that errors is dropped, never returned
+// to the pool, so a corrupt stream cannot poison a later inflate.
+type zlibResetter interface {
+	io.ReadCloser
+	Reset(r io.Reader, dict []byte) error
+}
+
+// emptyZlibStream is a valid zlib stream for empty input, used to seed the
+// pool: a zlib reader needs a real stream to initialize, and Reset then
+// re-points it at the stream to inflate.
+var emptyZlibStream = func() []byte {
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	_ = w.Close()
+	return buf.Bytes()
+}()
+
+var zlibReaderPool = sync.Pool{
+	New: func() interface{} {
+		zr, err := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+		if err != nil {
+			return nil
+		}
+		return zr
+	},
+}
+
 // inflateAt inflates one zlib stream starting at off; returns the data and
 // bytes consumed.
 func inflateAt(buf []byte, off int) ([]byte, int, error) {
 	sub := buf[off:]
 	cr := &countingReader{r: bytes.NewReader(sub)}
-	zr, err := zlib.NewReader(cr)
-	if err == nil {
-		data, rerr := io.ReadAll(zr)
-		cerr := zr.Close()
-		if rerr == nil && cerr == nil && cr.n > 0 && cr.n <= int64(len(sub)) {
-			return data, int(cr.n), nil
-		}
-		if rerr != nil {
-			err = rerr
-		} else if cerr != nil {
-			err = cerr
+	var err error
+	// Fast path: a pooled reader. On any failure the reader is dropped (not
+	// returned to the pool) and the error is kept for the fallback's report.
+	if pooled := zlibReaderPool.Get(); pooled != nil {
+		zr := pooled.(zlibResetter)
+		if rerr := zr.Reset(cr, nil); rerr == nil {
+			var data []byte
+			var readErr, closeErr error
+			data, readErr = io.ReadAll(zr)
+			closeErr = zr.Close()
+			if readErr == nil && closeErr == nil && cr.n > 0 && cr.n <= int64(len(sub)) {
+				zlibReaderPool.Put(zr)
+				return data, int(cr.n), nil
+			}
+			if readErr != nil {
+				err = readErr
+			} else if closeErr != nil {
+				err = closeErr
+			} else {
+				err = fmt.Errorf("pack entry is not a valid zlib stream")
+			}
 		} else {
-			err = fmt.Errorf("pack entry is not a valid zlib stream")
+			err = rerr
 		}
 	}
 	// Fallback: binary-search the minimal length that inflates cleanly.
@@ -354,9 +437,9 @@ func inflateAt(buf []byte, off int) ([]byte, int, error) {
 		}
 		return nil, 0, err
 	}
-	zr, _ = zlib.NewReader(bytes.NewReader(sub[:found]))
-	data, _ := io.ReadAll(zr)
-	_ = zr.Close()
+	fresh, _ := zlib.NewReader(bytes.NewReader(sub[:found]))
+	data, _ := io.ReadAll(fresh)
+	_ = fresh.Close()
 	return data, found, nil
 }
 
@@ -879,8 +962,13 @@ func v0Advertisement(service string, repo *Repo) []byte {
 	return parts.Bytes()
 }
 
-// v2Advertisement builds a v2 advertisement body (upload-pack only).
-func v2Advertisement() []byte {
+// v2Advertisement returns the v2 advertisement body (upload-pack only). It
+// never varies, so it is built once; callers only write it, never modify it.
+func v2Advertisement() []byte { return v2AdvertisementBytes }
+
+var v2AdvertisementBytes = buildV2Advertisement()
+
+func buildV2Advertisement() []byte {
 	lines := []string{
 		"version 2\n",
 		"agent=" + agent + "\n",
@@ -1305,14 +1393,9 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo, header
 			return
 		}
 		if command == "command=fetch" {
-			fetchReq := parseFetchRequest(lines)
-			if cached, ok := fetchCacheGet(repo, true, body); ok {
-				writeHeaders(w, 200, headers, uploadResult)
-				_, _ = w.Write(cached)
-				return
-			}
-			out := v2FetchResponse(repo, fetchReq)
-			fetchCachePut(repo, true, body, out)
+			out := fetchCached(fetchCacheKey(repo, true, body), func() []byte {
+				return v2FetchResponse(repo, parseFetchRequest(lines))
+			})
 			writeHeaders(w, 200, headers, uploadResult)
 			_, _ = w.Write(out)
 			return
@@ -1322,14 +1405,9 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo, header
 		return
 	}
 	// v0 fetch: two sections (wants, then haves) separated by flushes.
-	fetchReq := parseFetchRequest(lines)
-	if cached, ok := fetchCacheGet(repo, false, body); ok {
-		writeHeaders(w, 200, headers, uploadResult)
-		_, _ = w.Write(cached)
-		return
-	}
-	out := v0FetchResponse(repo, fetchReq)
-	fetchCachePut(repo, false, body, out)
+	out := fetchCached(fetchCacheKey(repo, false, body), func() []byte {
+		return v0FetchResponse(repo, parseFetchRequest(lines))
+	})
 	writeHeaders(w, 200, headers, uploadResult)
 	_, _ = w.Write(out)
 }
