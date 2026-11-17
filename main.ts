@@ -1,19 +1,29 @@
-// Entry point: the harness lifecycle. This process is a server the trial env drives:
-// it binds a port, hands the port to the env, and stays up until the env says the trial
-// is over. Nothing here is scored — the forge itself lives in app.ts — but the lifecycle
-// has to be exactly right or the trial never starts.
+// Entry point: the harness lifecycle. The forge itself is a Go binary; this
+// Node process is only the lifecycle that starts it, registers its port with
+// the trial env, and waits until the trial is over.
 //
 // Sequence:
 //   1. Read MAKEFUN_ENV_URL (the env's origin). No env, no trial: exit 1.
-//   2. Listen on port 0 so the kernel picks a free one. Never 8080; the env owns it.
-//   3. POST the port to $MAKEFUN_ENV_URL/register. 200 registers us; 409 means a first
-//      register already won and we just wait like any other entry. 400/405 are contract
-//      errors and end the program; anything else is retried (the env may be starting).
-//   4. GET $MAKEFUN_ENV_URL/done until it says {"done": true}. A poll is a quick request,
-//      not a held connection; a failed poll just means "not done yet".
-//   5. Close the server and exit 0. The harness stops the env, which writes the export.
+//   2. Pick a free port, then start ./forge-go on it (FORGE_PORT). The binary
+//      lives beside this file; /bot is read-only in the trial, so when the
+//      binary is not directly executable it is copied to /tmp first.
+//   3. Poll the binary's /healthz until it answers, then POST the port to
+//      $MAKEFUN_ENV_URL/register. 200 registers us; 409 means a first
+//      register already won and we just wait like any other entry. 400/405
+//      are contract errors and end the program; anything else is retried
+//      (the env may be starting).
+//   4. GET $MAKEFUN_ENV_URL/done until it says {"done": true}. A poll is a
+//      quick request, not a held connection; a failed poll just means
+//      "not done yet".
+//   5. Stop the Go binary and exit 0. The harness stops the env, which
+//      writes the export.
 
-import { createApp } from './app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { copyFileSync, chmodSync, accessSync, constants } from 'node:fs';
+import { createServer } from 'node:net';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (envUrl === '') {
@@ -21,7 +31,7 @@ if (envUrl === '') {
   process.exit(1);
 }
 
-// One register/done request may take this long before it is abandoned and retried.
+// One register/done/health request may take this long before it is abandoned and retried.
 const REQUEST_TIMEOUT = 30_000;
 // Backoff between retries: start here, double each time, never pass the cap.
 const BACKOFF_FIRST = 250;
@@ -32,6 +42,57 @@ const pause = (ms: number): Promise<void> => new Promise((done) => setTimeout(do
 // Wait after `n` failed attempts: exponential from BACKOFF_FIRST, capped at BACKOFF_MAX.
 function backoff(n: number): number {
   return Math.min(BACKOFF_MAX, BACKOFF_FIRST * 2 ** Math.min(n, 8));
+}
+
+/** Pick a free TCP port by binding port 0 and reading what the kernel chose. */
+function pickPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/** Start the Go binary on `port`. Returns the child process. */
+function startForge(port: number): ChildProcess {
+  const here = fileURLToPath(new URL('./forge-go', import.meta.url));
+  let bin = here;
+  try {
+    accessSync(here, constants.X_OK);
+  } catch {
+    // Not executable (the committed binary lost its bit, or /bot is
+    // read-only): copy it to /tmp and run it from there.
+    const tmpBin = join(tmpdir(), 'forge-go');
+    copyFileSync(here, tmpBin);
+    chmodSync(tmpBin, 0o755);
+    bin = tmpBin;
+  }
+  const child = spawn(bin, [], {
+    env: { ...process.env, FORGE_PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout?.on('data', (d: Buffer) => process.stdout.write(d));
+  child.stderr?.on('data', (d: Buffer) => process.stderr.write(d));
+  return child;
+}
+
+/** Wait until the forge answers /healthz (or give up after the timeout). */
+async function waitHealthy(port: number): Promise<void> {
+  const deadline = Date.now() + REQUEST_TIMEOUT;
+  for (let n = 0; ; n += 1) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(5_000) });
+      if (res.ok) return;
+    } catch {
+      // Not up yet.
+    }
+    if (Date.now() > deadline) throw new Error('the forge did not become healthy in time');
+    await pause(backoff(n));
+  }
 }
 
 // POST the bound port until the env accepts it.
@@ -71,24 +132,32 @@ async function waitUntilDone(): Promise<void> {
   }
 }
 
-// Bind the port, register it, then wait for the env: the whole life of the process.
+// Start the forge, register it, then wait for the env: the whole life of the process.
 async function run(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+  const port = await pickPort();
+  if (!port) throw new Error('could not pick a free port');
+  const child = startForge(port);
+  // If the forge dies before the trial ends, that is a failure, not a wait.
+  let forgeDead = false;
+  child.once('exit', (code) => {
+    forgeDead = true;
+    if (code !== 0 && code !== null) {
+      process.stderr.write(`[entry] the forge exited early with code ${code}\n`);
+    }
   });
-  const addr = server.address();
-  if (addr === null || typeof addr === 'string') {
-    throw new Error('the server did not bind an ephemeral TCP port');
-  }
-  process.stdout.write(`[entry] listening on port ${addr.port}\n`);
-
-  await registerPort(addr.port);
+  process.stdout.write(`[entry] forge starting on port ${port}\n`);
+  await waitHealthy(port);
+  process.stdout.write('[entry] forge is healthy\n');
+  await registerPort(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
-
   await waitUntilDone();
-  server.close();
+  if (!forgeDead) {
+    child.kill('SIGTERM');
+    await new Promise<void>((resolve) => {
+      child.once('exit', () => resolve());
+      setTimeout(resolve, 5_000);
+    });
+  }
   process.stdout.write('[entry] done\n');
 }
 
