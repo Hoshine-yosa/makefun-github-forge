@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,14 +35,53 @@ const (
 
 // ---------- pkt-line ----------
 
+const hexDigits = "0123456789abcdef"
+
+// putPktLen writes the 4-hex-digit pkt-line length n into dst[0:4]. It is
+// byte-for-byte what copy(dst[:4], fmt.Sprintf("%04x", n)) wrote, without the
+// formatter: n above 0xffff (never produced here) still takes the old path.
+func putPktLen(dst []byte, n int) {
+	if n > 0xffff {
+		copy(dst[:4], fmt.Sprintf("%04x", n))
+		return
+	}
+	dst[0] = hexDigits[n>>12]
+	dst[1] = hexDigits[(n>>8)&0xf]
+	dst[2] = hexDigits[(n>>4)&0xf]
+	dst[3] = hexDigits[n&0xf]
+}
+
+// appendPktLen appends the same 4 digits to dst.
+func appendPktLen(dst []byte, n int) []byte {
+	if n > 0xffff {
+		return append(dst, fmt.Sprintf("%04x", n)[:4]...)
+	}
+	return append(dst, hexDigits[n>>12], hexDigits[(n>>8)&0xf], hexDigits[(n>>4)&0xf], hexDigits[n&0xf])
+}
+
+// appendPkt appends one pkt-line whose payload is a+b+c+d (no intermediate
+// string or slice is built).
+func appendPkt(dst []byte, a, b, c, d string) []byte {
+	dst = appendPktLen(dst, len(a)+len(b)+len(c)+len(d)+4)
+	dst = append(dst, a...)
+	dst = append(dst, b...)
+	dst = append(dst, c...)
+	return append(dst, d...)
+}
+
 func pktLine(payload []byte) []byte {
 	out := make([]byte, 4+len(payload))
 	copy(out[4:], payload)
-	copy(out[:4], fmt.Sprintf("%04x", len(payload)+4))
+	putPktLen(out, len(payload)+4)
 	return out
 }
 
-func pktLineString(s string) []byte { return pktLine([]byte(s)) }
+func pktLineString(s string) []byte {
+	out := make([]byte, 4+len(s))
+	copy(out[4:], s)
+	putPktLen(out, len(s)+4)
+	return out
+}
 
 var flushPkt = []byte("0000")
 var delimPkt = []byte("0001")
@@ -66,22 +104,39 @@ func isHexDigit(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f')
 }
 
+// pktHeader decodes the four lowercase-hex length digits at buf[off:off+4]
+// (the caller has checked off+4 <= len(buf)). ok is false when any of the
+// four is not a lowercase hex digit — the same test isHexDigit applied.
+func pktHeader(buf []byte, off int) (length int, ok bool) {
+	for i := 0; i < 4; i++ {
+		c := buf[off+i]
+		var v int
+		switch {
+		case c >= '0' && c <= '9':
+			v = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = int(c-'a') + 10
+		default:
+			return 0, false
+		}
+		length = length<<4 | v
+	}
+	return length, true
+}
+
 // parsePktLines decodes a whole buffer into packets.
 // Returns an error on a bad header or truncation.
 func parsePktLines(buf []byte) ([]Pkt, error) {
-	var out []Pkt
+	out := make([]Pkt, 0, 16)
 	off := 0
 	for off < len(buf) {
 		if off+4 > len(buf) {
 			return nil, fmt.Errorf("truncated pkt-line: %d trailing byte(s)", len(buf)-off)
 		}
-		head := string(buf[off : off+4])
-		for i := 0; i < 4; i++ {
-			if !isHexDigit(head[i]) {
-				return nil, fmt.Errorf("invalid pkt-line length %q", head)
-			}
+		length, ok := pktHeader(buf, off)
+		if !ok {
+			return nil, fmt.Errorf("invalid pkt-line length %q", string(buf[off:off+4]))
 		}
-		length, _ := strconv.ParseInt(head, 16, 32)
 		if length == 0 {
 			out = append(out, Pkt{Kind: pktFlush})
 			off += 4
@@ -98,13 +153,13 @@ func parsePktLines(buf []byte) ([]Pkt, error) {
 			continue
 		}
 		if length < 4 {
-			return nil, fmt.Errorf("invalid pkt-line length %q", head)
+			return nil, fmt.Errorf("invalid pkt-line length %q", string(buf[off:off+4]))
 		}
-		if off+int(length) > len(buf) {
+		if off+length > len(buf) {
 			return nil, fmt.Errorf("truncated pkt-line: %d announced, %d available", length, len(buf)-off)
 		}
-		out = append(out, Pkt{Kind: pktData, Payload: buf[off+4 : off+int(length)]})
-		off += int(length)
+		out = append(out, Pkt{Kind: pktData, Payload: buf[off+4 : off+length]})
+		off += length
 	}
 	return out, nil
 }
@@ -115,18 +170,20 @@ func sideband(data []byte) []byte {
 	if len(data) == 0 {
 		return nil
 	}
-	var out bytes.Buffer
+	// One exact-size buffer, one copy of data: each chunk is its 4-digit
+	// length (1 band byte + chunk + 4 header), the band byte, then the chunk.
+	chunks := (len(data) + maxChunk - 1) / maxChunk
+	out := make([]byte, 0, len(data)+chunks*5)
 	for off := 0; off < len(data); off += maxChunk {
 		end := off + maxChunk
 		if end > len(data) {
 			end = len(data)
 		}
-		piece := make([]byte, 0, 1+end-off)
-		piece = append(piece, 1)
-		piece = append(piece, data[off:end]...)
-		out.Write(pktLine(piece))
+		out = appendPktLen(out, end-off+5)
+		out = append(out, 1)
+		out = append(out, data[off:end]...)
 	}
-	return out.Bytes()
+	return out
 }
 
 // ---------- packfile ----------
@@ -204,6 +261,9 @@ var fetchResponses = fetchCache{
 	flights: make(map[string]*fetchFlight),
 }
 
+// fetchCommandMarker is what every v2 command=fetch body contains.
+var fetchCommandMarker = []byte("command=fetch")
+
 // fetchCacheMaxBytes bounds the cache; above it the map is dropped wholesale.
 const fetchCacheMaxBytes = 32 << 20
 
@@ -213,7 +273,12 @@ func fetchCacheKey(repo *Repo, isV2 bool, body []byte) string {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	size := len(repo.Owner) + len(repo.Name) + len(body) + 32
+	for _, n := range names {
+		size += len(n) + len(repo.Refs[n]) + 2
+	}
 	var sb strings.Builder
+	sb.Grow(size)
 	sb.WriteString(repo.Owner)
 	sb.WriteByte('/')
 	sb.WriteString(repo.Name)
@@ -247,6 +312,15 @@ func (c *fetchCache) putLocked(key string, out []byte) {
 		c.bytes += len(out)
 	}
 	c.items[key] = out
+}
+
+// fetchPeek returns the cached response for key without building anything.
+func fetchPeek(key string) ([]byte, bool) {
+	c := &fetchResponses
+	c.mu.Lock()
+	out, ok := c.items[key]
+	c.mu.Unlock()
+	return out, ok
 }
 
 // fetchCached returns the response for key, calling build at most once among
@@ -915,7 +989,7 @@ func refLines(repo *Repo) []refLine {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	var out []refLine
+	out := make([]refLine, 0, len(names))
 	for _, name := range names {
 		oid := repo.Refs[name]
 		line := refLine{name: name, oid: oid}
@@ -938,28 +1012,28 @@ func v0Advertisement(service string, repo *Repo) []byte {
 	if service == "git-receive-pack" {
 		caps = receiveCaps
 	}
-	var parts bytes.Buffer
-	parts.Write(pktLineString("# service=" + service + "\n"))
-	parts.Write(flushPkt)
 	refs := refLines(repo)
 	main, hasMain := repo.Refs["refs/heads/main"]
+	// Built straight into one []byte: no per-line string, slice or Sprintf.
+	out := make([]byte, 0, 320+len(refs)*100)
+	out = appendPkt(out, "# service=", service, "\n", "")
+	out = append(out, flushPkt...)
 	if len(refs) == 0 {
-		parts.Write(pktLineString(ZERO_OID + " capabilities^{}\x00" + caps + "\n"))
+		out = appendPkt(out, ZERO_OID, " capabilities^{}\x00", caps, "\n")
 	} else {
 		headOid := main
 		if !hasMain {
 			headOid = refs[0].oid
 		}
-		parts.Write(pktLineString(headOid + " HEAD\x00" + caps + "\n"))
+		out = appendPkt(out, headOid, " HEAD\x00", caps, "\n")
 		for _, r := range refs {
-			parts.Write(pktLineString(r.oid + " " + r.name + "\n"))
+			out = appendPkt(out, r.oid, " ", r.name, "\n")
 			if r.peeled != "" {
-				parts.Write(pktLineString(r.peeled + " " + r.name + "^{}\n"))
+				out = appendPkt(out, r.peeled, " ", r.name, "^{}\n")
 			}
 		}
 	}
-	parts.Write(flushPkt)
-	return parts.Bytes()
+	return append(out, flushPkt...)
 }
 
 // v2Advertisement returns the v2 advertisement body (upload-pack only). It
@@ -1277,13 +1351,10 @@ func handleReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo, heade
 			if off+4 > len(body) {
 				return fmt.Errorf("truncated pkt-line: %d trailing byte(s)", len(body)-off)
 			}
-			head := string(body[off : off+4])
-			for i := 0; i < 4; i++ {
-				if !isHexDigit(head[i]) {
-					return fmt.Errorf("invalid pkt-line length %q", head)
-				}
+			length, hexOk := pktHeader(body, off)
+			if !hexOk {
+				return fmt.Errorf("invalid pkt-line length %q", string(body[off:off+4]))
 			}
-			length, _ := strconv.ParseInt(head, 16, 32)
 			if length == 0 {
 				off += 4
 				sawFlush = true
@@ -1294,12 +1365,12 @@ func handleReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo, heade
 				continue
 			}
 			if length < 4 {
-				return fmt.Errorf("invalid pkt-line length %q", head)
+				return fmt.Errorf("invalid pkt-line length %q", string(body[off:off+4]))
 			}
-			if off+int(length) > len(body) {
+			if off+length > len(body) {
 				return fmt.Errorf("truncated pkt-line: %d announced, %d available", length, len(body)-off)
 			}
-			line := strings.TrimSuffix(string(body[off+4:off+int(length)]), "\n")
+			line := strings.TrimSuffix(string(body[off+4:off+length]), "\n")
 			if nul := strings.IndexByte(line, 0); nul != -1 {
 				line = line[:nul]
 			}
@@ -1312,7 +1383,7 @@ func handleReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo, heade
 				return fmt.Errorf("bad receive-pack command: %q", cmd)
 			}
 			commands = append(commands, pushCommand{oldOid: parts[0], newOid: parts[1], ref: parts[2]})
-			off += int(length)
+			off += length
 		}
 		if !sawFlush {
 			return fmt.Errorf("receive-pack body has no flush after the command list")
@@ -1350,16 +1421,21 @@ func handleReceivePack(w http.ResponseWriter, r *http.Request, repo *Repo, heade
 			_, _ = w.Write(unpackErrorBody(perr.Error()))
 			return
 		}
+		// readPack already hashed every entry (e.Oid == gitSha(e.Type, e.Data)
+		// in both its plain and its delta branch), so insert by that oid
+		// instead of hashing each object a second time; first copy wins, as
+		// in storeObject.
 		for _, e := range pack.Entries {
-			StoreObject(repo.Objects, e.Type, e.Data)
+			if _, ok := repo.Objects[e.Oid]; !ok {
+				repo.Objects[e.Oid] = &GitObject{Type: e.Type, Data: e.Data}
+			}
 		}
 	}
 	results := make([]pushResult, 0, len(commands))
 	for _, cmd := range commands {
 		results = append(results, pushResult{ref: cmd.ref, reason: applyPush(repo, cmd)})
 	}
-	writeHeaders(w, 200, headers, receiveResult)
-	_, _ = w.Write(pushReport(results))
+	writeBody(w, 200, headers, receiveResult, pushReport(results))
 }
 
 // ---------- upload-pack ----------
@@ -1370,6 +1446,22 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo, header
 		writeHeaders(w, 500, headers, "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("failed to read request body"))
 		return
+	}
+	// Fast path for a repeated fetch: the cache only ever holds responses to
+	// bodies that already parsed cleanly (v2: whose first command= line is
+	// command=fetch; v0: any), and the key pins the exact body, the version
+	// and the repo state, so a hit is the response the full path would
+	// produce — without re-parsing the request first. A v2 body that cannot
+	// be command=fetch never contains the marker and skips the key work.
+	var key string
+	haveKey := false
+	if !isV2 || bytes.Contains(body, fetchCommandMarker) {
+		key = fetchCacheKey(repo, isV2, body)
+		haveKey = true
+		if out, ok := fetchPeek(key); ok {
+			writeBody(w, 200, headers, uploadResult, out)
+			return
+		}
 	}
 	pkts, err := parsePktLines(body)
 	if err != nil {
@@ -1388,16 +1480,17 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo, header
 		}
 		if command == "command=ls-refs" {
 			out := handleLsRefs(repo, lines)
-			writeHeaders(w, 200, headers, uploadResult)
-			_, _ = w.Write(out)
+			writeBody(w, 200, headers, uploadResult, out)
 			return
 		}
 		if command == "command=fetch" {
-			out := fetchCached(fetchCacheKey(repo, true, body), func() []byte {
+			if !haveKey {
+				key = fetchCacheKey(repo, true, body)
+			}
+			out := fetchCached(key, func() []byte {
 				return v2FetchResponse(repo, parseFetchRequest(lines))
 			})
-			writeHeaders(w, 200, headers, uploadResult)
-			_, _ = w.Write(out)
+			writeBody(w, 200, headers, uploadResult, out)
 			return
 		}
 		writeHeaders(w, 400, headers, uploadResult)
@@ -1405,11 +1498,10 @@ func handleUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo, header
 		return
 	}
 	// v0 fetch: two sections (wants, then haves) separated by flushes.
-	out := fetchCached(fetchCacheKey(repo, false, body), func() []byte {
+	out := fetchCached(key, func() []byte {
 		return v0FetchResponse(repo, parseFetchRequest(lines))
 	})
-	writeHeaders(w, 200, headers, uploadResult)
-	_, _ = w.Write(out)
+	writeBody(w, 200, headers, uploadResult, out)
 }
 
 // ---------- router ----------
@@ -1424,22 +1516,80 @@ func writeHeaders(w http.ResponseWriter, status int, headers map[string]string, 
 	w.WriteHeader(status)
 }
 
+// writeBody is writeHeaders plus the body, with an explicit Content-Length.
+// Without it net/http switches to chunked encoding once a reply passes 2 KiB
+// (extra framing, an extra write, and several read events for the client);
+// with it a reply goes out as header + body. Status and body bytes are the
+// same as writeHeaders followed by w.Write(body).
+func writeBody(w http.ResponseWriter, status int, headers map[string]string, contentType string, body []byte) {
+	h := w.Header()
+	for k, v := range headers {
+		h.Set(k, v)
+	}
+	h.Set("Content-Type", contentType)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
 func writeJSONError(w http.ResponseWriter, status int, headers map[string]string, message string) {
 	writeHeaders(w, status, headers, jsonContentType)
 	_, _ = w.Write([]byte(`{"message":` + strconv.Quote(message) + `}`))
 }
 
-var gitPathRe = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git/(info/refs|git-upload-pack|git-receive-pack)$`)
+// parseGitPath matches exactly what the regexp
+//
+//	^/([^/]+)/([^/]+)\.git/(info/refs|git-upload-pack|git-receive-pack)$
+//
+// matched, without the regexp engine (which backtracks on the repo segment
+// and allocates a match slice on every git request).
+func parseGitPath(path string) (owner, repo, op string, ok bool) {
+	if len(path) == 0 || path[0] != '/' {
+		return "", "", "", false
+	}
+	rest := path[1:]
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 { // no second segment, or an empty owner
+		return "", "", "", false
+	}
+	ownerPart := rest[:i]
+	rest = rest[i+1:]
+	j := strings.IndexByte(rest, '/')
+	if j <= len(".git") { // no op segment, or an empty repo name
+		return "", "", "", false
+	}
+	seg := rest[:j]
+	opPart := rest[j+1:]
+	if !strings.HasSuffix(seg, ".git") {
+		return "", "", "", false
+	}
+	switch opPart {
+	case "info/refs", "git-upload-pack", "git-receive-pack":
+		return ownerPart, seg[:len(seg)-len(".git")], opPart, true
+	}
+	return "", "", "", false
+}
+
+// serviceParam is r.URL.Query().Get("service"), with the two exact query
+// strings git clients send answered without parsing the query into a map.
+func serviceParam(r *http.Request) string {
+	switch r.URL.RawQuery {
+	case "service=git-upload-pack":
+		return "git-upload-pack"
+	case "service=git-receive-pack":
+		return "git-receive-pack"
+	}
+	return r.URL.Query().Get("service")
+}
 
 // handleGit handles /{owner}/{repo}.git/{info/refs|git-upload-pack|
 // git-receive-pack}. It returns true when the path is a git path (handled or
 // 404'd); false when the path is not a git path at all.
 func handleGit(w http.ResponseWriter, r *http.Request, store *Store) bool {
-	m := gitPathRe.FindStringSubmatch(r.URL.Path)
-	if m == nil {
+	owner, repoName, op, matched := parseGitPath(r.URL.Path)
+	if !matched {
 		return false
 	}
-	owner, repoName, op := m[1], m[2], m[3]
 	reqID := store.NextRequestId()
 	headers := map[string]string{"x-github-request-id": reqID}
 
@@ -1465,22 +1615,19 @@ func handleGit(w http.ResponseWriter, r *http.Request, store *Store) bool {
 	}
 
 	if op == "info/refs" {
-		service := r.URL.Query().Get("service")
+		service := serviceParam(r)
 		if service == "git-upload-pack" {
 			isV2 := r.Header.Get("Git-Protocol") == "version=2"
 			if isV2 {
-				writeHeaders(w, 200, headers, uploadAd)
-				_, _ = w.Write(v2Advertisement())
+				writeBody(w, 200, headers, uploadAd, v2Advertisement())
 			} else {
-				writeHeaders(w, 200, headers, uploadAd)
-				_, _ = w.Write(v0Advertisement("git-upload-pack", repo))
+				writeBody(w, 200, headers, uploadAd, v0Advertisement("git-upload-pack", repo))
 			}
 			return true
 		}
 		if service == "git-receive-pack" {
 			// Receive-pack is v0-only, whatever the client asked for.
-			writeHeaders(w, 200, headers, receiveAd)
-			_, _ = w.Write(v0Advertisement("git-receive-pack", repo))
+			writeBody(w, 200, headers, receiveAd, v0Advertisement("git-receive-pack", repo))
 			return true
 		}
 		writeJSONError(w, 400, headers, "Missing service parameter")

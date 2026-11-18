@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -34,11 +35,37 @@ type GitObject struct {
 // Objects is the per-repo object map. Keys are hex SHAs.
 type Objects map[string]*GitObject
 
+// gitShaSmall is the largest object gitSha hashes in one shot.
+const gitShaSmall = 2048
+
+// gitSha is sha1("<type> <len>\x00" + data) in hex. The header is built with
+// strconv instead of fmt.Fprintf, and an object up to gitShaSmall bytes is
+// hashed in one shot from a stack buffer (no hash.Hash allocation, no
+// interface calls); larger ones stream through a digest. Same id either way.
 func gitSha(typ ObjType, data []byte) string {
-	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", string(typ), len(data))
-	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	var sum [sha1.Size]byte
+	if len(data) <= gitShaSmall {
+		var buf [gitShaSmall + 40]byte
+		b := append(buf[:0], string(typ)...)
+		b = append(b, ' ')
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, 0)
+		b = append(b, data...)
+		sum = sha1.Sum(b)
+	} else {
+		var hdr [40]byte
+		b := append(hdr[:0], string(typ)...)
+		b = append(b, ' ')
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, 0)
+		h := sha1.New()
+		h.Write(b)
+		h.Write(data)
+		_ = h.Sum(sum[:0])
+	}
+	var out [2 * sha1.Size]byte
+	hex.Encode(out[:], sum[:])
+	return string(out[:])
 }
 
 // GitSha returns the git object id for type+data.
@@ -244,9 +271,28 @@ func Ancestors(objects Objects, sha string) map[string]bool {
 	return seen
 }
 
-// IsAncestor reports whether a is an ancestor of (or equal to) b.
+// IsAncestor reports whether a is an ancestor of (or equal to) b. It walks
+// b's history and stops as soon as it reaches a, instead of building the
+// whole ancestor set: the push fast-forward check only needs reachability,
+// and the common case (a is b's direct parent) is one step.
 func IsAncestor(objects Objects, a, b string) bool {
-	return Ancestors(objects, b)[a]
+	seen := map[string]bool{}
+	stack := []string{b}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if cur == a {
+			return true
+		}
+		if seen[cur] {
+			continue
+		}
+		seen[cur] = true
+		if info := ParseCommit(objects, cur); info != nil {
+			stack = append(stack, info.Parents...)
+		}
+	}
+	return false
 }
 
 // MergeBase returns a merge base of two commits: the first common ancestor found walking b's history.
